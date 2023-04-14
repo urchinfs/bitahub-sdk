@@ -22,7 +22,8 @@ const (
 	TokenExpireTime = 60 * 60 * 1
 	TokenExpiredMsg = "登录超时，请重新登录"
 
-	BitaHubUrl = "https://www.bitahub.com/"
+	BitaHubUrl       = "https://www.bitahub.com/"
+	SaltSignedUrlStr = "salt-mock-"
 )
 
 const (
