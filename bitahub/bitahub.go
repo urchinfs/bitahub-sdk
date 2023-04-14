@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"github.com/go-resty/resty/v2"
 	"github.com/urchinfs/bitahub-sdk/types"
+	"github.com/urchinfs/bitahub-sdk/util"
 	"io"
 	"net/http"
 	"path/filepath"
@@ -59,32 +60,48 @@ type Client interface {
 	CreateDir(ctx context.Context, datasetName, folderName string) error
 
 	GetDirMetadata(ctx context.Context, datasetName, folderKey string) (*FileInfo, bool, error)
+
+	PreTransfer(ctx context.Context, datasetName, fileName string) error
+
+	PostTransfer(ctx context.Context, datasetName, fileName string, isSuccess bool) error
+
+	GetCoroutineCount(ctx context.Context, datasetName, fileName string) (int32, error)
+
+	GetParallelCount(ctx context.Context, datasetName, fileName string) (int32, error)
 }
 
 type client struct {
 	httpClient           *resty.Client
+	redisStorage         *util.RedisStorage
 	token                string
 	tokenExpireTimestamp int64
 	username             string
 	password             string
 	bitaHubUrl           string
-	projectId            int64
-	projectName          string
+	redisEndpoints       []string
+	redisPassword        string
+	enableCluster        bool
 }
 
-func New(username, password, bitaHubUrl string, projectId int64, projectName string) (Client, error) {
+func New(username, password, bitaHubUrl string, redisEndpoints []string, redisPassword string, enableCluster bool) (Client, error) {
 	b := &client{
-		username:    username,
-		password:    password,
-		bitaHubUrl:  bitaHubUrl,
-		projectId:   projectId,
-		projectName: projectName,
-		httpClient:  resty.New(),
+		username:       username,
+		password:       password,
+		bitaHubUrl:     bitaHubUrl,
+		redisEndpoints: redisEndpoints,
+		redisPassword:  redisPassword,
+		enableCluster:  enableCluster,
+		httpClient:     resty.New(),
+		redisStorage:   util.NewRedisStorage(redisEndpoints, redisPassword, enableCluster),
 	}
 	b.httpClient.SetTLSClientConfig(&tls.Config{InsecureSkipVerify: true})
 
 	if b.username == "" || b.password == "" || b.bitaHubUrl == "" {
-		return nil, errors.New("parameter error")
+		return nil, types.ErrorInvalidParameter
+	}
+
+	if b.redisStorage == nil {
+		return nil, errors.New("init redis error")
 	}
 
 	return b, nil
@@ -236,7 +253,7 @@ func (c *client) sendHttpRequest(ctx context.Context, httpMethod, httpPath strin
 				return err
 			}
 		} else {
-			return errors.New("internal error")
+			return types.ErrorInternal
 		}
 
 		if !response.IsSuccess() {
@@ -691,9 +708,44 @@ func (c *client) IsDatasetExist(ctx context.Context, datasetName string) (bool, 
 }
 
 func (c *client) GetDownloadLink(ctx context.Context, datasetName, fileName string, expire time.Duration) (string, error) {
+	fileName = strings.TrimLeft(fileName, "/")
+	fileName = strings.TrimRight(fileName, "/")
+	downloadInfoKey := c.redisStorage.MakeStorageKey([]string{datasetName, fileName}, "")
+	value, err := c.redisStorage.Get(downloadInfoKey)
+	if err != nil {
+		if err != types.ErrorNotExists {
+			return "", err
+		}
+	} else {
+		ttlDuration, err := c.redisStorage.GetTTL(downloadInfoKey)
+		if err != nil {
+			return "", err
+		}
+
+		if ttlDuration < util.DefaultMinOpTimeout {
+			_ = c.redisStorage.SetTTL(downloadInfoKey, util.DefaultMinOpTimeout)
+		}
+
+		if value != nil {
+			signedUrl := fmt.Sprintf("%s/gateway/fileCenter/api/split/outer/download/%s", c.bitaHubUrl, string(value))
+			return signedUrl, nil
+		}
+	}
+
+	memberCnt, err := c.redisStorage.GetSetMemberCnt(util.MembersSetKey)
+	if err != nil {
+		return "", err
+	}
+
+	if memberCnt > util.DefaultMaxMembersCnt {
+		return "", types.ErrorNotAllowed
+	}
+
 	const (
 		DefaultSignedUrlTime = 60 * 60 * 6
+		ErrorDirBigFile      = "Code:10007"
 	)
+
 	nowTime := time.Now().Unix()
 	if c.tokenExpireTimestamp-nowTime < DefaultSignedUrlTime {
 		c.token = ""
@@ -708,12 +760,6 @@ func (c *client) GetDownloadLink(ctx context.Context, datasetName, fileName stri
 		dirName = "/" + dirName
 	}
 
-	if strings.HasSuffix(fileName, "/") {
-		bhPath := fmt.Sprintf("/gateway/fileCenter/api/split/outer/download/%s", filepath.Join(dirName, fileName))
-		signedUrl := c.bitaHubUrl + bhPath
-		return signedUrl, nil
-	}
-
 	jsonBody, err := json.Marshal([]string{filepath.Join(dirName, fileName)})
 	if err != nil {
 		return "", errors.New("internal error: json.Unmarshal fail")
@@ -723,11 +769,27 @@ func (c *client) GetDownloadLink(ctx context.Context, datasetName, fileName stri
 	resp := &GetDownloadCodeResp{}
 	err = c.sendHttpRequest(ctx, types.HttpMethodPost, bhPath, string(jsonBody), resp)
 	if err != nil {
+		if strings.Contains(err.Error(), ErrorDirBigFile) {
+			downloadInfo := types.SaltSignedUrlStr + filepath.Join(datasetName, fileName)
+			err = c.redisStorage.SetWithTimeout(downloadInfoKey, []byte(downloadInfo), util.DefaultOpTimeout)
+			if err != nil {
+				return "", err
+			}
+
+			signedUrl := fmt.Sprintf("%s/gateway/fileCenter/api/split/outer/download/%s", c.bitaHubUrl, downloadInfo)
+			return signedUrl, nil
+		}
+
 		return "", err
 	}
 
-	bhPath = fmt.Sprintf("/gateway/fileCenter/api/split/outer/download/%d/%s", resp.DownloadId, resp.DownloadCode)
-	signedUrl := c.bitaHubUrl + bhPath
+	downloadInfo := fmt.Sprintf("%d/%s", resp.DownloadId, resp.DownloadCode)
+	signedUrl := fmt.Sprintf("%s/gateway/fileCenter/api/split/outer/download/%s", c.bitaHubUrl, downloadInfo)
+
+	err = c.redisStorage.SetWithTimeout(downloadInfoKey, []byte(downloadInfo), util.DefaultOpTimeout)
+	if err != nil {
+		return "", err
+	}
 
 	return signedUrl, nil
 }
@@ -784,4 +846,123 @@ func (c *client) GetDirMetadata(ctx context.Context, datasetName, folderKey stri
 	}
 
 	return &folderInfo, true, nil
+}
+
+func (c *client) PreTransfer(ctx context.Context, datasetName, fileName string) error {
+	fileName = strings.TrimLeft(fileName, "/")
+	fileName = strings.TrimRight(fileName, "/")
+	downloadInfoKey := c.redisStorage.MakeStorageKey([]string{datasetName, fileName}, "")
+	err := c.redisStorage.InsertSet(util.MembersSetKey, downloadInfoKey)
+	if err != nil {
+		return err
+	}
+
+	value, err := c.redisStorage.Get(downloadInfoKey)
+	if err != nil {
+		if err == types.ErrorNotExists {
+			return nil
+		}
+
+		return err
+	}
+
+	if strings.Contains(string(value), types.SaltSignedUrlStr) {
+		return nil
+	}
+
+	if err := c.refreshToken(ctx); err != nil {
+		return err
+	}
+
+	bhPath := fmt.Sprintf("/gateway/fileCenter/api/split/outer/downloadProbe/%s", string(value))
+	err = c.sendHttpRequest(ctx, types.HttpMethodGet, bhPath, "", nil)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (c *client) PostTransfer(ctx context.Context, datasetName, fileName string, isSuccess bool) error {
+	fileName = strings.TrimLeft(fileName, "/")
+	fileName = strings.TrimRight(fileName, "/")
+	downloadInfoKey := c.redisStorage.MakeStorageKey([]string{datasetName, fileName}, "")
+	value, err := c.redisStorage.Get(downloadInfoKey)
+	if err != nil {
+		if err == types.ErrorNotExists {
+			return nil
+		}
+
+		return err
+	}
+
+	if strings.Contains(string(value), types.SaltSignedUrlStr) {
+		return nil
+	}
+
+	if err := c.refreshToken(ctx); err != nil {
+		return err
+	}
+
+	if isSuccess {
+		bhPath := fmt.Sprintf("/gateway/fileCenter/api/split/outer/markSucess/%s", string(value))
+		err := c.sendHttpRequest(ctx, types.HttpMethodGet, bhPath, "", nil)
+		if err != nil {
+			return err
+		}
+	} else {
+		bhPath := fmt.Sprintf("/gateway/fileCenter/api/split/outer/deleteDownloadRecord/%s", string(value))
+		err := c.sendHttpRequest(ctx, types.HttpMethodGet, bhPath, "", nil)
+		if err != nil {
+			return err
+		}
+	}
+
+	err = c.redisStorage.Delete(downloadInfoKey)
+	if err != nil {
+		return err
+	}
+
+	err = c.redisStorage.DeleteSetMember(util.MembersSetKey, downloadInfoKey)
+	if err != nil {
+		return err
+	}
+
+	processedMemberCnt, _ := c.redisStorage.GetSetMemberCnt(util.ProcessedMembersSetKey)
+	if processedMemberCnt > 0 {
+		time.Sleep(time.Second * 11)
+
+		_ = c.redisStorage.Delete(util.ProcessedMembersSetKey)
+	}
+	_ = c.redisStorage.InsertSet(util.ProcessedMembersSetKey, downloadInfoKey)
+
+	return nil
+}
+
+func (c *client) GetCoroutineCount(ctx context.Context, datasetName, fileName string) (int32, error) {
+	value, err := c.redisStorage.GetMapElement(util.ConfStorageKey, "coroutineCount")
+	if err != nil {
+		return -1, err
+	}
+
+	cnt, err := strconv.Atoi(string(value))
+	if err != nil {
+		return -1, err
+	}
+
+	return int32(cnt), nil
+}
+
+func (c *client) GetParallelCount(ctx context.Context, datasetName, fileName string) (int32, error) {
+	value, err := c.redisStorage.GetMapElement(util.ConfStorageKey, "parallelCount")
+	if err != nil {
+		return -1, err
+	}
+
+	cnt, err := strconv.Atoi(string(value))
+	if err != nil {
+		return -1, err
+	}
+
+	return int32(cnt), nil
 }
