@@ -929,8 +929,8 @@ func (c *client) PostTransfer(ctx context.Context, datasetName, fileName string,
 
 	_ = c.redisStorage.InsertSet(util.ProcessedMembersSetKey, downloadInfoKey)
 	processedMemberCnt, _ := c.redisStorage.GetSetMemberCnt(util.ProcessedMembersSetKey)
-	time.Sleep(time.Second * time.Duration(processedMemberCnt) * 10)
-	if processedMemberCnt >= 7 {
+	time.Sleep(time.Second * time.Duration(processedMemberCnt) * 5)
+	if processedMemberCnt >= 8 {
 		_ = c.redisStorage.Delete(util.ProcessedMembersSetKey)
 	}
 
