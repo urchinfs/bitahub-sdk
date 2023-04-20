@@ -927,13 +927,12 @@ func (c *client) PostTransfer(ctx context.Context, datasetName, fileName string,
 		return err
 	}
 
+	_ = c.redisStorage.InsertSet(util.ProcessedMembersSetKey, downloadInfoKey)
 	processedMemberCnt, _ := c.redisStorage.GetSetMemberCnt(util.ProcessedMembersSetKey)
-	if processedMemberCnt > 0 {
-		time.Sleep(time.Second * 11)
-
+	time.Sleep(time.Second * time.Duration(processedMemberCnt) * 10)
+	if processedMemberCnt >= 7 {
 		_ = c.redisStorage.Delete(util.ProcessedMembersSetKey)
 	}
-	_ = c.redisStorage.InsertSet(util.ProcessedMembersSetKey, downloadInfoKey)
 
 	return nil
 }
