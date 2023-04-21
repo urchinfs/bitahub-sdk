@@ -133,6 +133,15 @@ type Reply struct {
 	Data json.RawMessage `json:"data,omitempty"`
 }
 
+func needRetry(r *Reply) bool {
+	if strings.Contains(r.Message.Message, "≤Ÿ◊˜Ã´∆µ∑±£¨«Î…‘∫Û‘Ÿ ‘") ||
+		strings.Contains(r.Message.Message, "Timeout") {
+		return true
+	}
+
+	return false
+}
+
 func (r Reply) String() string {
 	return fmt.Sprintf("{Code: %d, Message: %s, Status: %d}",
 		r.Message.Code, r.Message.Message, r.Message.Status)
@@ -259,12 +268,8 @@ func (c *client) sendHttpRequest(ctx context.Context, httpMethod, httpPath strin
 		if !response.IsSuccess() {
 			err := json.Unmarshal(response.Body(), r)
 			if err == nil {
-				if r.Message.Code == -1 && r.Message.Status == 200 && r.Message.Message == types.TokenExpiredMsg {
-					c.token = ""
-					if err = c.refreshToken(ctx); err != nil {
-						return err
-					}
-
+				if needRetry(r) {
+					time.Sleep(time.Second * 21)
 					continue
 				}
 			}
@@ -708,6 +713,8 @@ func (c *client) IsDatasetExist(ctx context.Context, datasetName string) (bool, 
 }
 
 func (c *client) GetDownloadLink(ctx context.Context, datasetName, fileName string, expire time.Duration) (string, error) {
+	oriDatasetName := datasetName
+	oriFileName := fileName
 	fileName = strings.TrimLeft(fileName, "/")
 	fileName = strings.TrimRight(fileName, "/")
 	downloadInfoKey := c.redisStorage.MakeStorageKey([]string{datasetName, fileName}, "")
@@ -755,6 +762,28 @@ func (c *client) GetDownloadLink(ctx context.Context, datasetName, fileName stri
 		return "", err
 	}
 
+	expireTick := time.Duration(0)
+	if !strings.HasSuffix(oriFileName, "/") {
+		fileInfo, err := c.StatFile(ctx, oriDatasetName, oriFileName)
+		if err == nil {
+			if fileInfo.Size <= types.MB_100 {
+				expireTick = time.Duration(time.Second * 60 * 5)
+			} else if fileInfo.Size <= types.MB_500 {
+				expireTick = time.Duration(time.Second * 60 * 10)
+			} else if fileInfo.Size <= types.GB_1 {
+				expireTick = time.Duration(time.Second * 60 * 60 * 1)
+			} else if fileInfo.Size <= types.GB_10 {
+				expireTick = time.Duration(time.Second * 60 * 60 * 3)
+			} else if fileInfo.Size <= types.GB_100 {
+				expireTick = time.Duration(time.Second * 60 * 60 * 36)
+			}
+		}
+	}
+
+	if expireTick == 0 {
+		expireTick = util.DefaultOpTimeout
+	}
+
 	dirName := datasetName
 	if !strings.HasPrefix(dirName, "/") {
 		dirName = "/" + dirName
@@ -771,7 +800,7 @@ func (c *client) GetDownloadLink(ctx context.Context, datasetName, fileName stri
 	if err != nil {
 		if strings.Contains(err.Error(), ErrorDirBigFile) {
 			downloadInfo := types.SaltSignedUrlStr + filepath.Join(datasetName, fileName)
-			err = c.redisStorage.SetWithTimeout(downloadInfoKey, []byte(downloadInfo), util.DefaultOpTimeout)
+			err = c.redisStorage.SetWithTimeout(downloadInfoKey, []byte(downloadInfo), expireTick)
 			if err != nil {
 				return "", err
 			}
@@ -786,7 +815,7 @@ func (c *client) GetDownloadLink(ctx context.Context, datasetName, fileName stri
 	downloadInfo := fmt.Sprintf("%d/%s", resp.DownloadId, resp.DownloadCode)
 	signedUrl := fmt.Sprintf("%s/gateway/fileCenter/api/split/outer/download/%s", c.bitaHubUrl, downloadInfo)
 
-	err = c.redisStorage.SetWithTimeout(downloadInfoKey, []byte(downloadInfo), util.DefaultOpTimeout)
+	err = c.redisStorage.SetWithTimeout(downloadInfoKey, []byte(downloadInfo), expireTick)
 	if err != nil {
 		return "", err
 	}
@@ -875,11 +904,7 @@ func (c *client) PreTransfer(ctx context.Context, datasetName, fileName string) 
 	}
 
 	bhPath := fmt.Sprintf("/gateway/fileCenter/api/split/outer/downloadProbe/%s", string(value))
-	err = c.sendHttpRequest(ctx, types.HttpMethodGet, bhPath, "", nil)
-	if err != nil {
-		return err
-	}
-
+	_ = c.sendHttpRequest(ctx, types.HttpMethodGet, bhPath, "", nil)
 	_ = c.redisStorage.SetTTL(util.MembersSetKey, util.DefaultMembersSetTimeout)
 	return nil
 }
@@ -904,16 +929,10 @@ func (c *client) PostTransfer(ctx context.Context, datasetName, fileName string,
 
 		if isSuccess {
 			bhPath := fmt.Sprintf("/gateway/fileCenter/api/split/outer/markSucess/%s", string(value))
-			err := c.sendHttpRequest(ctx, types.HttpMethodGet, bhPath, "", nil)
-			if err != nil {
-				return err
-			}
+			_ = c.sendHttpRequest(ctx, types.HttpMethodGet, bhPath, "", nil)
 		} else {
 			bhPath := fmt.Sprintf("/gateway/fileCenter/api/split/outer/deleteDownloadRecord/%s", string(value))
-			err := c.sendHttpRequest(ctx, types.HttpMethodGet, bhPath, "", nil)
-			if err != nil {
-				return err
-			}
+			_ = c.sendHttpRequest(ctx, types.HttpMethodGet, bhPath, "", nil)
 		}
 	}
 

@@ -43,6 +43,14 @@ const (
 )
 
 const (
+	GB_100 = 1024 * 1024 * 1024 * 100
+	GB_10  = 1024 * 1024 * 1024 * 10
+	GB_1   = 1024 * 1024 * 1024
+	MB_500 = 1024 * 1024 * 500
+	MB_100 = 1024 * 1024 * 100
+)
+
+const (
 	// AffinitySeparator is separator of affinity.
 	AffinitySeparator = "|"
 )
