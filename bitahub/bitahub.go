@@ -134,8 +134,7 @@ type Reply struct {
 }
 
 func needRetry(r *Reply) bool {
-	if strings.Contains(r.Message.Message, "²Ù×÷Ì«Æµ·±£¬ÇëÉÔºóÔÙÊÔ") ||
-		strings.Contains(r.Message.Message, "Timeout") {
+	if r.Message.Code == 20003 {
 		return true
 	}
 
