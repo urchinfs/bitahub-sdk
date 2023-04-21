@@ -10,7 +10,7 @@ import (
 
 const (
 	DefaultOpTimeout         = 86400 * 1 * time.Second
-	DefaultMinOpTimeout      = 60 * 60 * 6 * time.Second
+	DefaultMinOpTimeout      = 60 * 5 * time.Second
 	DefaultMembersSetTimeout = 60 * 60 * 2 * time.Second
 	DefaultMaxMembersCnt     = 1
 
